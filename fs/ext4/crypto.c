@@ -261,7 +261,6 @@ static int ext4_page_crypto(struct inode *inode,
 			    struct page *src_page,
 			    struct page *dest_page,
 			    gfp_t gfp_flags)
-
 {
 	u8 xts_tweak[EXT4_XTS_TWEAK_SIZE];
 	struct ablkcipher_request *req = NULL;
@@ -389,14 +388,12 @@ int ext4_decrypt(struct page *page)
 				page->index, page, page, GFP_NOFS);
 }
 
-int ext4_encrypted_zeroout(struct inode *inode, struct ext4_extent *ex)
+int ext4_encrypted_zeroout(struct inode *inode, ext4_lblk_t lblk,
+			   ext4_fsblk_t pblk, ext4_lblk_t len)
 {
 	struct ext4_crypto_ctx	*ctx;
 	struct page		*ciphertext_page = NULL;
 	struct bio		*bio;
-	ext4_lblk_t		lblk = le32_to_cpu(ex->ee_block);
-	ext4_fsblk_t		pblk = ext4_ext_pblock(ex);
-	unsigned int		len = ext4_ext_get_actual_len(ex);
 	int			ret, err = 0;
 
 #if 0
@@ -418,12 +415,20 @@ int ext4_encrypted_zeroout(struct inode *inode, struct ext4_extent *ex)
 	}
 
 	while (len--) {
-		err = ext4_page_crypto(inode, EXT4_ENCRYPT, lblk,
+#ifdef CONFIG_EXT4_PRIVATE_ENCRYPTION
+		if (!inode->i_mapping->private_enc_mode) {
+#endif /* CONFIG_EXT4_PRIVATE_ENCRYPTION */
+			err = ext4_page_crypto(inode, EXT4_ENCRYPT, lblk,
 				       ZERO_PAGE(0), ciphertext_page,
 				       GFP_NOFS);
-		if (err)
-			goto errout;
-
+			if (err)
+				goto errout;
+#ifdef CONFIG_EXT4_PRIVATE_ENCRYPTION
+		} else {
+			memset(page_address(ciphertext_page), 0, PAGE_SIZE);
+			ciphertext_page->mapping = inode->i_mapping;
+		}
+#endif /* CONFIG_EXT4_PRIVATE_ENCRYPTION */
 		bio = bio_alloc(GFP_NOWAIT, 1);
 		if (!bio) {
 			err = -ENOMEM;
@@ -453,13 +458,23 @@ int ext4_encrypted_zeroout(struct inode *inode, struct ext4_extent *ex)
 	}
 	err = 0;
 errout:
+#ifdef CONFIG_EXT4_PRIVATE_ENCRYPTION
+	if (inode->i_mapping->private_enc_mode)
+		ciphertext_page->mapping = NULL;
+#endif /* CONFIG_EXT4_PRIVATE_ENCRYPTION */
 	ext4_release_crypto_ctx(ctx);
 	return err;
 }
 
 bool ext4_valid_contents_enc_mode(uint32_t mode)
 {
+#ifdef CONFIG_EXT4_PRIVATE_ENCRYPTION
+	return (mode == EXT4_ENCRYPTION_MODE_AES_256_XTS) || \
+		      (mode == EXT4_PRIVATE_ENCRYPTION_MODE_AES_256_XTS) || \
+		      (mode == EXT4_ENCRYPTION_MODE_PRIVATE);
+#else
 	return (mode == EXT4_ENCRYPTION_MODE_AES_256_XTS);
+#endif /* CONFIG_EXT4_PRIVATE_ENCRYPTION */
 }
 
 /**
@@ -496,6 +511,11 @@ static int ext4_d_revalidate(struct dentry *dentry, unsigned int flags)
 		return 0;
 	}
 	ci = EXT4_I(d_inode(dir))->i_crypt_info;
+//	if (ci && ci->ci_keyring_key &&
+//	    (ci->ci_keyring_key->flags & ((1 << KEY_FLAG_INVALIDATED) |
+//					  (1 << KEY_FLAG_REVOKED) |
+//					  (1 << KEY_FLAG_DEAD))))
+//		ci = NULL;
 
 	/* this should eventually be an flag in d_flags */
 	cached_with_key = dentry->d_fsdata != NULL;
